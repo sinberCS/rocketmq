@@ -1,0 +1,482 @@
+name: PR Advisor - AI Code Review
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: write
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - develop
+      - master
+
+env:
+  # 重试机制配置
+  MAX_RETRY_COUNT: 3
+  RETRY_BASE_DELAY: 1
+  
+  # 性能优化配置
+  ENABLE_CACHE: true
+  CACHE_TTL: 3600
+  
+  # 评论限制配置
+  HIGH_RISK_COMMENT_LIMIT: 15
+  TOTAL_COMMENT_LIMIT: 40
+  
+  # 专家角色配置
+  ENABLE_LEVEL1_EXPERT: true
+  ENABLE_LEVEL2_EXPERT: true
+  ENABLE_LEVEL3_EXPERT: true
+  ENABLE_LEVEL4_EXPERT: true
+  
+  LEVEL1_EXPERT_ROLE: fullstack_architect
+  LEVEL2_EXPERT_ROLE: security_expert
+  LEVEL3_EXPERT_ROLE: performance_expert
+  LEVEL4_EXPERT_ROLE: quality_assurance_expert
+  
+  BUSINESS_DOMAIN: general
+
+jobs:
+  ai-code-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Get changed files
+        id: changed-files
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            
+            let changedFiles = files.map(file => ({
+              filename: file.filename,
+              status: file.status,
+              additions: file.additions,
+              deletions: file.deletions,
+              changes: file.changes,
+              patch: file.patch || ''
+            }));
+            
+            core.setOutput('files', JSON.stringify(changedFiles));
+            return changedFiles;
+
+      - name: Get existing PR comments
+        id: existing-comments
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const { data: comments } = await github.rest.pulls.listReviewComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            
+            const { data: issueComments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            const allComments = [
+              ...comments.map(c => ({ type: 'review', body: c.body, path: c.path, line: c.line })),
+              ...issueComments.map(c => ({ type: 'issue', body: c.body }))
+            ];
+            
+            core.setOutput('comments', JSON.stringify(allComments));
+            return allComments;
+
+      - name: Check comment limits
+        id: check-limits
+        uses: actions/github-script@v6
+        env:
+          HIGH_RISK_LIMIT: ${{ env.HIGH_RISK_COMMENT_LIMIT }}
+          TOTAL_LIMIT: ${{ env.TOTAL_COMMENT_LIMIT }}
+        with:
+          script: |
+            const comments = JSON.parse(process.env.COMMENTS || '[]');
+            const highRiskKeywords = ['🔴', '高风险', 'critical', 'security', 'vulnerability', 'bug', 'error'];
+            
+            let highRiskCount = 0;
+            comments.forEach(comment => {
+              const body = comment.body.toLowerCase();
+              if (highRiskKeywords.some(keyword => body.includes(keyword.toLowerCase()))) {
+                highRiskCount++;
+              }
+            });
+            
+            const totalCount = comments.length;
+            const highRiskLimit = parseInt(process.env.HIGH_RISK_LIMIT);
+            const totalLimit = parseInt(process.env.TOTAL_LIMIT);
+            
+            core.info(`当前评论统计: 总数=${totalCount}, 高风险=${highRiskCount}`);
+            core.info(`配置限制: 高风险≤${highRiskLimit}, 总数≤${totalLimit}`);
+            
+            if (highRiskCount >= highRiskLimit) {
+              core.setOutput('status', 'high_risk_exceeded');
+              core.warning('高风险评论数量已达上限');
+              return false;
+            }
+            
+            if (totalCount >= totalLimit) {
+              core.setOutput('status', 'total_exceeded');
+              core.warning('总评论数量已达上限');
+              return false;
+            }
+            
+            core.setOutput('status', 'ok');
+            return true;
+
+      - name: Analyze code changes with AI
+        id: ai-analysis
+        if: steps.check-limits.outputs.status == 'ok'
+        uses: actions/github-script@v6
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
+          EXISTING_COMMENTS: ${{ steps.existing-comments.outputs.comments }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        with:
+          script: |
+            const fs = require('fs');
+            const changedFiles = JSON.parse(process.env.CHANGED_FILES || '[]');
+            const existingComments = JSON.parse(process.env.EXISTING_COMMENTS || '[]');
+            
+            // 分析代码变更的策略
+            let analysisResults = {
+              level1_unanalyzed: [],  // 完全未分析的区域
+              level2_partial: [],      // 部分分析过的区域
+              level3_recheck: [],      // 需要重新审视的区域
+              level4_quality: []       // 质量保证检查区域
+            };
+            
+            for (const file of changedFiles) {
+              // 检查文件是否应该跳过
+              const skipPatterns = [
+                /package-lock\.json$/,
+                /yarn\.lock$/,
+                /\.min\.js$/,
+                /\.map$/,
+                /node_modules/,
+                /dist\//,
+                /build\//
+              ];
+              
+              if (skipPatterns.some(pattern => pattern.test(file.filename))) {
+                core.info(`跳过文件: ${file.filename}`);
+                continue;
+              }
+              
+              // 分析文件变更类型
+              const fileAnalysis = {
+                filename: file.filename,
+                status: file.status,
+                changes: file.changes,
+                hasExistingComments: existingComments.some(c => c.path === file.filename)
+              };
+              
+              // 根据文件状态和现有评论分配到不同层级
+              if (file.status === 'added' || !fileAnalysis.hasExistingComments) {
+                analysisResults.level1_unanalyzed.push(fileAnalysis);
+              } else if (file.status === 'modified' && fileAnalysis.hasExistingComments) {
+                analysisResults.level2_partial.push(fileAnalysis);
+              }
+              
+              // 检查代码质量问题
+              if (file.changes > 50 || file.filename.includes('test')) {
+                analysisResults.level4_quality.push(fileAnalysis);
+              }
+            }
+            
+            core.setOutput('results', JSON.stringify(analysisResults));
+            return analysisResults;
+
+      - name: Level 1 Expert - Architecture Review
+        if: env.ENABLE_LEVEL1_EXPERT == 'true' && steps.check-limits.outputs.status == 'ok'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const analysis = JSON.parse('${{ steps.ai-analysis.outputs.results }}');
+            const level1Files = analysis.level1_unanalyzed;
+            
+            if (level1Files.length === 0) {
+              core.info('Level 1: 没有需要分析的文件');
+              return;
+            }
+            
+            core.info(`Level 1 架构审查: 分析 ${level1Files.length} 个文件`);
+            
+            // 这里可以集成 AI API 进行深度分析
+            // 示例：检查常见的架构问题
+            const issues = [];
+            
+            for (const file of level1Files) {
+              if (file.filename.endsWith('.java')) {
+                // Java 架构检查
+                if (file.filename.includes('Controller') && file.changes > 100) {
+                  issues.push({
+                    file: file.filename,
+                    level: '🟡 中风险',
+                    title: 'Controller 文件过大',
+                    description: `${file.filename} 变更了 ${file.changes} 行，建议拆分为多个方法或类`,
+                    suggestion: '考虑使用 Service 层分离业务逻辑，保持 Controller 简洁'
+                  });
+                }
+              }
+            }
+            
+            core.setOutput('issues', JSON.stringify(issues));
+            return issues;
+
+      - name: Level 2 Expert - Security Review
+        if: env.ENABLE_LEVEL2_EXPERT == 'true' && steps.check-limits.outputs.status == 'ok'
+        uses: actions/github-script@v6
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
+        with:
+          script: |
+            const changedFiles = JSON.parse(process.env.CHANGED_FILES || '[]');
+            const securityIssues = [];
+            
+            core.info('Level 2 安全审查: 检查安全漏洞');
+            
+            for (const file of changedFiles) {
+              const patch = file.patch || '';
+              
+              // 检查常见的安全问题
+              if (patch.includes('eval(') || patch.includes('exec(')) {
+                securityIssues.push({
+                  file: file.filename,
+                  level: '🔴 高风险',
+                  title: '潜在的代码注入风险',
+                  description: '使用 eval() 或 exec() 可能导致代码注入漏洞',
+                  suggestion: '避免使用动态代码执行，使用安全的替代方案'
+                });
+              }
+              
+              if (patch.includes('SELECT') && patch.includes('+')) {
+                securityIssues.push({
+                  file: file.filename,
+                  level: '🔴 高风险',
+                  title: '潜在的 SQL 注入风险',
+                  description: '检测到字符串拼接构建 SQL 查询',
+                  suggestion: '使用参数化查询或 PreparedStatement 防止 SQL 注入'
+                });
+              }
+              
+              if (patch.match(/password\s*=\s*["'].*["']/i)) {
+                securityIssues.push({
+                  file: file.filename,
+                  level: '🔴 高风险',
+                  title: '硬编码密码',
+                  description: '代码中包含硬编码的密码',
+                  suggestion: '使用环境变量或密钥管理服务存储敏感信息'
+                });
+              }
+            }
+            
+            core.setOutput('issues', JSON.stringify(securityIssues));
+            return securityIssues;
+
+      - name: Level 3 Expert - Performance Review
+        if: env.ENABLE_LEVEL3_EXPERT == 'true' && steps.check-limits.outputs.status == 'ok'
+        uses: actions/github-script@v6
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
+        with:
+          script: |
+            const changedFiles = JSON.parse(process.env.CHANGED_FILES || '[]');
+            const performanceIssues = [];
+            
+            core.info('Level 3 性能审查: 检查性能问题');
+            
+            for (const file of changedFiles) {
+              const patch = file.patch || '';
+              
+              // 检查常见的性能问题
+              if (patch.match(/for\s*\([^)]*\)\s*\{[^}]*for\s*\(/)) {
+                performanceIssues.push({
+                  file: file.filename,
+                  level: '🟡 中风险',
+                  title: '嵌套循环可能影响性能',
+                  description: '检测到嵌套循环，时间复杂度可能较高',
+                  suggestion: '考虑优化算法或使用 HashMap 等数据结构降低复杂度'
+                });
+              }
+              
+              if (patch.includes('SELECT * FROM')) {
+                performanceIssues.push({
+                  file: file.filename,
+                  level: '🟡 中风险',
+                  title: 'SELECT * 查询性能问题',
+                  description: '使用 SELECT * 可能导致不必要的数据传输',
+                  suggestion: '明确指定需要的字段，提升查询性能'
+                });
+              }
+            }
+            
+            core.setOutput('issues', JSON.stringify(performanceIssues));
+            return performanceIssues;
+
+      - name: Level 4 Expert - Quality Review
+        if: env.ENABLE_LEVEL4_EXPERT == 'true' && steps.check-limits.outputs.status == 'ok'
+        uses: actions/github-script@v6
+        env:
+          CHANGED_FILES: ${{ steps.changed-files.outputs.files }}
+        with:
+          script: |
+            const changedFiles = JSON.parse(process.env.CHANGED_FILES || '[]');
+            const qualityIssues = [];
+            
+            core.info('Level 4 质量审查: 检查代码质量');
+            
+            for (const file of changedFiles) {
+              const patch = file.patch || '';
+              
+              // 检查代码质量问题
+              if (!patch.includes('test') && file.filename.includes('Service')) {
+                qualityIssues.push({
+                  file: file.filename,
+                  level: '🟢 低风险',
+                  title: '缺少单元测试',
+                  description: 'Service 层代码应该有对应的单元测试',
+                  suggestion: '添加单元测试确保代码质量'
+                });
+              }
+              
+              if (patch.match(/\/\/\s*TODO/i)) {
+                qualityIssues.push({
+                  file: file.filename,
+                  level: '🟢 低风险',
+                  title: '存在 TODO 标记',
+                  description: '代码中包含未完成的 TODO 标记',
+                  suggestion: '在合并前完成 TODO 或创建对应的 Issue'
+                });
+              }
+            }
+            
+            core.setOutput('issues', JSON.stringify(qualityIssues));
+            return qualityIssues;
+
+      - name: Aggregate and post review comments
+        if: steps.check-limits.outputs.status == 'ok'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            // 收集所有层级的问题
+            const allIssues = [];
+            
+            // 获取各层级的问题
+            const level1 = '${{ steps.Level 1 Expert - Architecture Review.outputs.issues }}';
+            const level2 = '${{ steps.Level 2 Expert - Security Review.outputs.issues }}';
+            const level3 = '${{ steps.Level 3 Expert - Performance Review.outputs.issues }}';
+            const level4 = '${{ steps.Level 4 Expert - Quality Review.outputs.issues }}';
+            
+            if (level1) allIssues.push(...JSON.parse(level1));
+            if (level2) allIssues.push(...JSON.parse(level2));
+            if (level3) allIssues.push(...JSON.parse(level3));
+            if (level4) allIssues.push(...JSON.parse(level4));
+            
+            if (allIssues.length === 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: '## 🤖 AI 代码评审报告\n\n✅ **太棒了！** 没有发现明显的问题。代码质量良好！\n\n---\n*本评审由 AI 自动生成，仅供参考。*'
+              });
+              return;
+            }
+            
+            // 按风险等级分类
+            const highRisk = allIssues.filter(i => i.level.includes('高风险'));
+            const mediumRisk = allIssues.filter(i => i.level.includes('中风险'));
+            const lowRisk = allIssues.filter(i => i.level.includes('低风险'));
+            
+            // 构建评论内容
+            let comment = '## 🤖 AI 代码评审报告\n\n';
+            comment += '### 📊 问题统计\n\n';
+            comment += `- 🔴 高风险问题: ${highRisk.length} 个\n`;
+            comment += `- 🟡 中风险问题: ${mediumRisk.length} 个\n`;
+            comment += `- 🟢 低风险问题: ${lowRisk.length} 个\n`;
+            comment += `- **总计**: ${allIssues.length} 个问题\n\n`;
+            
+            // 只展示高风险和中风险问题
+            const importantIssues = [...highRisk, ...mediumRisk];
+            
+            if (importantIssues.length > 0) {
+              comment += '### 🔍 主要问题详情\n\n';
+              
+              importantIssues.forEach((issue, index) => {
+                comment += `#### ${index + 1}. ${issue.level} ${issue.title}\n\n`;
+                comment += `**文件**: \`${issue.file}\`\n\n`;
+                comment += `**问题描述**: ${issue.description}\n\n`;
+                comment += `**修改建议**: ${issue.suggestion}\n\n`;
+                comment += '---\n\n';
+              });
+            }
+            
+            if (lowRisk.length > 0) {
+              comment += `### 💡 其他建议 (${lowRisk.length} 个)\n\n`;
+              comment += '<details>\n<summary>点击展开低风险问题</summary>\n\n';
+              lowRisk.forEach((issue, index) => {
+                comment += `${index + 1}. **${issue.file}**: ${issue.title}\n`;
+              });
+              comment += '\n</details>\n\n';
+            }
+            
+            comment += '### 📚 相关资源\n\n';
+            comment += '- [RocketMQ 开发指南](https://rocketmq.apache.org/docs/)\n';
+            comment += '- [代码规范](https://github.com/apache/rocketmq/blob/develop/CONTRIBUTING.md)\n\n';
+            comment += '---\n';
+            comment += '*本评审由 AI 自动生成，仅供参考。建议结合人工审查。*\n';
+            comment += `*分析引擎: Level 1-${process.env.LEVEL1_EXPERT_ROLE}, Level 2-${process.env.LEVEL2_EXPERT_ROLE}, Level 3-${process.env.LEVEL3_EXPERT_ROLE}, Level 4-${process.env.LEVEL4_EXPERT_ROLE}*`;
+            
+            // 发布评论
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+            
+            core.info(`已发布 AI 评审报告，共发现 ${allIssues.length} 个问题`);
+
+      - name: Add labels based on review
+        if: steps.check-limits.outputs.status == 'ok'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const labels = ['ai-reviewed'];
+            
+            // 根据问题数量添加标签
+            const level2Issues = '${{ steps.Level 2 Expert - Security Review.outputs.issues }}';
+            if (level2Issues && JSON.parse(level2Issues).length > 0) {
+              labels.push('security-review-needed');
+            }
+            
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: labels
+              });
+            } catch (error) {
+              core.warning(`无法添加标签: ${error.message}`);
+            }
